@@ -118,7 +118,7 @@ class PgVectorEmbeddingStore:
                 """
                 SELECT id_imagen, embedding, path, breed, metadata
                 FROM embeddings
-                ORDER BY embedding <=> %s
+                ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
                 (query, k),
