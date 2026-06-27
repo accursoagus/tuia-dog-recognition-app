@@ -25,7 +25,14 @@ class Settings(BaseSettings):
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "baseline")
     model_path: Path = Path(os.getenv("MODEL_PATH", "models"))
     resnet18_model_name: str = os.getenv("RESNET18_MODEL_NAME", "resnet18_finetuned.pth")
-    cnn_custom_model_name: str = os.getenv("CNN_CUSTOM_MODEL_NAME", "cnn_custom.pth")
+    batch_size: int = int(os.getenv("BATCH_SIZE", "32"))
+    max_epochs: int = int(os.getenv("MAX_EPOCHS", "15"))
+    patience: int = int(os.getenv("PATIENCE", "4"))
+    lr_head: float = float(os.getenv("LR_HEAD", "1e-3"))
+    lr_backbone: float = float(os.getenv("LR_BACKBONE", "1e-4"))
+    step_size: int = int(os.getenv("STEP_SIZE", "5"))
+    gamma: float = float(os.getenv("GAMMA", "0.5"))
+    cnn_custom_model_name: str = os.getenv("CNN_CUSTOM_MODEL_NAME", "cnn_custom.pth")    
 
     # Busqueda por similitud
     similarity_metric: str = os.getenv("SIMILARITY_METRIC", "cosine")
