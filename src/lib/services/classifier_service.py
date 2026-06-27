@@ -152,8 +152,8 @@ class ClassifierService:
             )
 
         n_classes = len(train_ds.classes)
-        train_loader = DataLoader(train_ds, batch_size=self.settings.batch_size, shuffle=True, num_workers=2)
-        valid_loader = DataLoader(valid_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2)
+        train_loader = DataLoader(train_ds, batch_size=self.settings.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        valid_loader = DataLoader(valid_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
         if self.active_model_name == "resnet18_finetuned":
             model = self._build_resnet18_finetuned(n_classes)
@@ -258,7 +258,7 @@ class ClassifierService:
                 "(probable inconsistencia de nombres de carpeta)."
             )
 
-        test_loader = DataLoader(test_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2)
+        test_loader = DataLoader(test_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
         all_preds, all_labels = [], []
         with torch.no_grad():
