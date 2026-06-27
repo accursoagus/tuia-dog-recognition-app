@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
+from PIL import Image
 
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
@@ -75,7 +77,52 @@ class DetectionService:
 
         Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise ImportError(
+                "No está instalada la librería ultralytics. "
+                "Agregá 'ultralytics' a requirements.txt e instalá las dependencias."
+            ) from exc
+
+        if image is None or image.size == 0:
+            logger.warning("detect_dogs recibió una imagen vacía.")
+            return []
+
+        height, width = image.shape[:2]
+
+        # Carga lazy del modelo YOLO: se carga una sola vez y queda cacheado.
+        if not hasattr(self, "_yolo_model"):
+            logger.info("Cargando modelo YOLO: %s", self.yolo_model_name)
+            self._yolo_model = YOLO(self.yolo_model_name)
+
+        results = self._yolo_model.predict(
+            source=image,
+            conf=float(self.conf_threshold),
+            classes=[int(self.dog_class_id)],
+            verbose=False,
+        )
+
+        detections: list[tuple[tuple[int, int, int, int], float]] = []
+
+        if not results:
+            return detections
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return detections
+
+        for box in boxes:
+            xyxy = box.xyxy[0].detach().cpu().numpy()
+            conf = float(box.conf[0].detach().cpu().item())
+
+            x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+            x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, height, width)
+
+            detections.append(((x1, y1, x2, y2), conf))
+
+        return detections
+        
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
