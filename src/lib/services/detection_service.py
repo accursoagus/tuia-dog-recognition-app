@@ -124,6 +124,7 @@ class DetectionService:
         return detections
         
 
+
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
         Clasifica la raza del recorte de un perro detectado usando el modelo
@@ -131,7 +132,53 @@ class DetectionService:
 
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        if crop is None or crop.size == 0:
+            logger.warning("classify_detected_dog recibió un recorte vacío.")
+            return "unknown", 0.0
+
+        checkpoint = self.classifier.load_model()
+        class_names = checkpoint["class_names"]
+        n_classes = len(class_names)
+
+        # Cache del modelo de clasificación ya reconstruido.
+        cache_key = f"classification_model{self.classifier.active_model_name}"
+
+        if not hasattr(self, cache_key):
+            if self.classifier.active_model_name == "resnet18_finetuned":
+                model = self.classifier._build_resnet18_finetuned(n_classes)
+            elif self.classifier.active_model_name == "cnn_custom":
+                model = self.classifier._build_cnn_custom(n_classes)
+            else:
+                raise ValueError(
+                    f"Modelo de clasificación desconocido: "
+                    f"{self.classifier.active_model_name}"
+                )
+
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.to(self.classifier.device)
+            model.eval()
+
+            setattr(self, cache_key, model)
+
+        model = getattr(self, cache_key)
+
+        # El crop viene en BGR porque se leyó con OpenCV.
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(crop_rgb)
+
+        transform = self.classifier._build_transforms(train=False)
+        tensor = transform(pil_image).unsqueeze(0).to(self.classifier.device)
+
+        with torch.no_grad():
+            outputs = model(tensor)
+            probs = torch.softmax(outputs, dim=1)
+            score, pred_idx = torch.max(probs, dim=1)
+
+        breed = class_names[int(pred_idx.item())]
+        confidence = float(score.item())
+
+        return breed, confidence
+
 
     # ------------------------------------------------------------------
     # Orquestacion provista
