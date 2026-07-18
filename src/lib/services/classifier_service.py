@@ -138,76 +138,156 @@ class ClassifierService:
         train_tf = self._build_transforms(train=True)
         valid_tf = self._build_transforms(train=False)
 
-        train_ds = datasets.ImageFolder(self.dataset_path / "train", transform=train_tf)
-        valid_ds = datasets.ImageFolder(self.dataset_path / "valid", transform=valid_tf)
+        train_ds = datasets.ImageFolder(
+            self.dataset_path / "train",
+            transform=train_tf,
+        )
+
+        valid_ds = datasets.ImageFolder(
+            self.dataset_path / "valid",
+            transform=valid_tf,
+        )
 
         if train_ds.classes != valid_ds.classes:
             only_train = set(train_ds.classes) - set(valid_ds.classes)
             only_valid = set(valid_ds.classes) - set(train_ds.classes)
+
             raise ValueError(
                 "Las clases de train y valid no coinciden exactamente "
                 "(probable inconsistencia de nombres de carpeta, ej. espacios "
-                f"extra). Solo en train: {only_train}. Solo en valid: {only_valid}. "
+                f"extra). Solo en train: {only_train}. "
+                f"Solo en valid: {only_valid}. "
                 "Normalizar nombres de carpeta antes de entrenar."
             )
 
         n_classes = len(train_ds.classes)
-        train_loader = DataLoader(train_ds, batch_size=self.settings.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        valid_loader = DataLoader(valid_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.settings.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=self.device.type == "cuda",
+        )
+
+        valid_loader = DataLoader(
+            valid_ds,
+            batch_size=self.settings.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=self.device.type == "cuda",
+        )
 
         if self.active_model_name == "resnet18_finetuned":
             model = self._build_resnet18_finetuned(n_classes)
-            optimizer = torch.optim.Adam([
-                {"params": model.layer4.parameters(), "lr": self.settings.lr_backbone},
-                {"params": model.fc.parameters(), "lr": self.settings.lr_head},
-            ])
+
+            optimizer = torch.optim.Adam(
+                [
+                    {
+                        "params": model.layer4.parameters(),
+                        "lr": self.settings.lr_backbone,
+                    },
+                    {
+                        "params": model.fc.parameters(),
+                        "lr": self.settings.lr_head,
+                    },
+                ]
+            )
+
         elif self.active_model_name == "cnn_custom":
             model = self._build_cnn_custom(n_classes)
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.settings.lr_head)
+
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=self.settings.lr_head,
+            )
+
         else:
-            raise ValueError(f"Modelo desconocido para entrenamiento: {self.active_model_name}")
+            raise ValueError(
+                "Modelo desconocido para entrenamiento: "
+                f"{self.active_model_name}"
+            )
 
         criterion = nn.CrossEntropyLoss()
+
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=self.settings.step_size, gamma=self.settings.gamma
+            optimizer,
+            step_size=self.settings.step_size,
+            gamma=self.settings.gamma,
         )
 
         best_valid_loss = float("inf")
+        best_epoch = 0
+        best_model_state = None
         epochs_without_improvement = 0
-        history = {"train_loss": [], "valid_loss": [], "train_acc": [], "valid_acc": []}
+
+        history = {
+            "train_loss": [],
+            "valid_loss": [],
+            "train_acc": [],
+            "valid_acc": [],
+        }
 
         for epoch in range(self.settings.max_epochs):
+            # --------------------------------------------------------
+            # Entrenamiento
+            # --------------------------------------------------------
             model.train()
-            running_loss, correct, total = 0.0, 0, 0
+
+            running_loss = 0.0
+            correct = 0
+            total = 0
+
             for images, labels in train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
                 optimizer.zero_grad()
+
                 outputs = model(images)
                 loss = criterion(outputs, labels)
+
                 loss.backward()
                 optimizer.step()
 
                 running_loss += loss.item() * images.size(0)
-                correct += (outputs.argmax(dim=1) == labels).sum().item()
+                correct += (
+                    outputs.argmax(dim=1) == labels
+                ).sum().item()
                 total += labels.size(0)
 
             train_loss = running_loss / total
             train_acc = correct / total
 
+            # --------------------------------------------------------
+            # Validación
+            # --------------------------------------------------------
             model.eval()
-            v_running_loss, v_correct, v_total = 0.0, 0, 0
+
+            valid_running_loss = 0.0
+            valid_correct = 0
+            valid_total = 0
+
             with torch.no_grad():
                 for images, labels in valid_loader:
-                    images, labels = images.to(self.device), labels.to(self.device)
+                    images = images.to(self.device)
+                    labels = labels.to(self.device)
+
                     outputs = model(images)
                     loss = criterion(outputs, labels)
-                    v_running_loss += loss.item() * images.size(0)
-                    v_correct += (outputs.argmax(dim=1) == labels).sum().item()
-                    v_total += labels.size(0)
 
-            valid_loss = v_running_loss / v_total
-            valid_acc = v_correct / v_total
-            scheduler.step()
+                    valid_running_loss += (
+                        loss.item() * images.size(0)
+                    )
+
+                    valid_correct += (
+                        outputs.argmax(dim=1) == labels
+                    ).sum().item()
+
+                    valid_total += labels.size(0)
+
+            valid_loss = valid_running_loss / valid_total
+            valid_acc = valid_correct / valid_total
 
             history["train_loss"].append(train_loss)
             history["valid_loss"].append(valid_loss)
@@ -215,27 +295,85 @@ class ClassifierService:
             history["valid_acc"].append(valid_acc)
 
             logger.info(
-                "epoch %d/%d - train_loss=%.4f train_acc=%.4f valid_loss=%.4f valid_acc=%.4f",
-                epoch + 1, self.settings.max_epochs, train_loss, train_acc, valid_loss, valid_acc,
+                "epoch %d/%d - "
+                "train_loss=%.4f train_acc=%.4f "
+                "valid_loss=%.4f valid_acc=%.4f",
+                epoch + 1,
+                self.settings.max_epochs,
+                train_loss,
+                train_acc,
+                valid_loss,
+                valid_acc,
             )
 
+            # Se conservan en memoria los pesos correspondientes
+            # al menor valid_loss.
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
+                best_epoch = epoch + 1
                 epochs_without_improvement = 0
-                self.active_checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "class_names": train_ds.classes,
-                    "model_name": self.active_model_name,
-                    "history": history,
-                }, self.active_checkpoint)
+
+                best_model_state = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
+
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= self.settings.patience:
-                    logger.info("Early stopping en epoch %d (sin mejora en %d epochs).", epoch + 1, self.settings.patience)
-                    break
 
-        self._loaded.pop(self.active_model_name, None)
+            scheduler.step()
+
+            if (
+                epochs_without_improvement
+                >= self.settings.patience
+            ):
+                logger.info(
+                    "Early stopping en epoch %d "
+                    "(sin mejora en %d epochs).",
+                    epoch + 1,
+                    self.settings.patience,
+                )
+                break
+
+        if best_model_state is None:
+            raise RuntimeError(
+                "El entrenamiento finalizó sin obtener "
+                "un modelo válido."
+            )
+
+        # El checkpoint se guarda una sola vez al finalizar:
+        # contiene los mejores pesos y el historial completo.
+        self.active_checkpoint.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        torch.save(
+            {
+                "model_state_dict": best_model_state,
+                "class_names": train_ds.classes,
+                "model_name": self.active_model_name,
+                "history": history,
+                "best_epoch": best_epoch,
+                "best_valid_loss": best_valid_loss,
+                "epochs_trained": len(history["train_loss"]),
+            },
+            self.active_checkpoint,
+        )
+
+        logger.info(
+            "Entrenamiento finalizado. "
+            "Mejor valid_loss=%.4f en epoch %d. "
+            "Épocas ejecutadas=%d.",
+            best_valid_loss,
+            best_epoch,
+            len(history["train_loss"]),
+        )
+
+        self._loaded.pop(
+            self.active_model_name,
+            None,
+        )
 
     def evaluate_classifier(self) -> dict[str, float]:
         checkpoint = self.load_model()
