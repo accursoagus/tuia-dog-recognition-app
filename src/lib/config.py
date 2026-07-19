@@ -116,6 +116,7 @@ class Settings(BaseSettings):
 
     data_path: Path = Path("data")
     dataset_path: Path = Path("data/dataset")
+    external_dataset_file_id: str = ""
     output_path: Path = Path("output")
 
     # ---------------------------------------------------------

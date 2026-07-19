@@ -166,7 +166,7 @@ class ClassifierService:
             train_ds,
             batch_size=self.settings.batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=0 if self.device.type == "cpu" else 2,
             pin_memory=self.device.type == "cuda",
         )
 
@@ -174,7 +174,7 @@ class ClassifierService:
             valid_ds,
             batch_size=self.settings.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=0 if self.device.type == "cpu" else 2,
             pin_memory=self.device.type == "cuda",
         )
 
@@ -396,7 +396,7 @@ class ClassifierService:
                 "(probable inconsistencia de nombres de carpeta)."
             )
 
-        test_loader = DataLoader(test_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=0 if self.device.type == "cpu" else 2, pin_memory=self.device.type == "cuda")
 
         all_preds, all_labels = [], []
         with torch.no_grad():
