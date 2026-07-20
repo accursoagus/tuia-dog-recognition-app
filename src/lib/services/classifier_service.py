@@ -6,10 +6,22 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, models, transforms
 import onnxruntime
+
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from lib.config import Settings
+
 
 logger = logging.getLogger(__name__)
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 class ClassifierService:
     """Etapa 2: entrenamiento y comparacion de modelos de clasificacion.
@@ -29,6 +41,7 @@ class ClassifierService:
         image_size: int,
         dataset_path: Path,
         output_path: Path,
+        settings: "Settings",
         active_model: str = "resnet18_finetuned",
     ) -> None:
         # checkpoints: nombre logico -> ruta del archivo (ej. resnet18_finetuned -> models/resnet18_finetuned.pth)
@@ -36,8 +49,10 @@ class ClassifierService:
         self.image_size = image_size
         self.dataset_path = dataset_path
         self.output_path = output_path
+        self.settings = settings
         self.active_model_name = active_model
         self._loaded: dict[str, Any] = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ------------------------------------------------------------------
     # Infraestructura provista
@@ -78,48 +93,342 @@ class ClassifierService:
             raise ValueError(f"Unsupported model format (expected .pth or .onnx): {path}")
         self._loaded[key] = model
         return model
+    
+
+    def _build_transforms(self, train: bool) -> transforms.Compose:
+        base = [transforms.Resize((self.image_size, self.image_size))]
+        if train:
+            base += [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            ]
+        base += [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+        return transforms.Compose(base)
+
+    def _build_resnet18_finetuned(self, n_classes: int) -> nn.Module:
+        model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+        model.fc = nn.Linear(model.fc.in_features, n_classes)
+        return model.to(self.device)
+
+    def _build_cnn_custom(self, n_classes: int) -> nn.Module:
+        model = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(256, n_classes),
+        )
+        return model.to(self.device)
 
     # ------------------------------------------------------------------
     # Etapa 2: funciones a implementar
     # ------------------------------------------------------------------
 
     def train_classifier(self) -> None:
-        """
-        Entrena el clasificador de razas sobre el dataset (self.dataset_path).
+        train_tf = self._build_transforms(train=True)
+        valid_tf = self._build_transforms(train=False)
 
-        Modelo A (obligatorio): fine-tuning de ResNet18 pre-entrenado.
-        Modelo B (opcional, recomendado): CNN propia.
+        train_ds = datasets.ImageFolder(
+            self.dataset_path / "train",
+            transform=train_tf,
+        )
 
-        Debe:
-          - Usar los splits train/valid definidos en la notebook.
-          - Aplicar el preprocesamiento y data augmentation justificados.
-          - Guardar el checkpoint resultante en self.active_checkpoint
-            (ej: models/resnet18_finetuned.pth).
-        """
-        raise NotImplementedError("Etapa 2: implementar train_classifier")
+        valid_ds = datasets.ImageFolder(
+            self.dataset_path / "valid",
+            transform=valid_tf,
+        )
+
+        if train_ds.classes != valid_ds.classes:
+            only_train = set(train_ds.classes) - set(valid_ds.classes)
+            only_valid = set(valid_ds.classes) - set(train_ds.classes)
+
+            raise ValueError(
+                "Las clases de train y valid no coinciden exactamente "
+                "(probable inconsistencia de nombres de carpeta, ej. espacios "
+                f"extra). Solo en train: {only_train}. "
+                f"Solo en valid: {only_valid}. "
+                "Normalizar nombres de carpeta antes de entrenar."
+            )
+
+        n_classes = len(train_ds.classes)
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.settings.batch_size,
+            shuffle=True,
+            num_workers=0 if self.device.type == "cpu" else 2,
+            pin_memory=self.device.type == "cuda",
+        )
+
+        valid_loader = DataLoader(
+            valid_ds,
+            batch_size=self.settings.batch_size,
+            shuffle=False,
+            num_workers=0 if self.device.type == "cpu" else 2,
+            pin_memory=self.device.type == "cuda",
+        )
+
+        if self.active_model_name == "resnet18_finetuned":
+            model = self._build_resnet18_finetuned(n_classes)
+
+            optimizer = torch.optim.Adam(
+                [
+                    {
+                        "params": model.layer4.parameters(),
+                        "lr": self.settings.lr_backbone,
+                    },
+                    {
+                        "params": model.fc.parameters(),
+                        "lr": self.settings.lr_head,
+                    },
+                ]
+            )
+
+        elif self.active_model_name == "cnn_custom":
+            model = self._build_cnn_custom(n_classes)
+
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=self.settings.lr_head,
+            )
+
+        else:
+            raise ValueError(
+                "Modelo desconocido para entrenamiento: "
+                f"{self.active_model_name}"
+            )
+
+        criterion = nn.CrossEntropyLoss()
+
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=self.settings.step_size,
+            gamma=self.settings.gamma,
+        )
+
+        best_valid_loss = float("inf")
+        best_epoch = 0
+        best_model_state = None
+        epochs_without_improvement = 0
+
+        history = {
+            "train_loss": [],
+            "valid_loss": [],
+            "train_acc": [],
+            "valid_acc": [],
+        }
+
+        for epoch in range(self.settings.max_epochs):
+            # --------------------------------------------------------
+            # Entrenamiento
+            # --------------------------------------------------------
+            model.train()
+
+            running_loss = 0.0
+            correct = 0
+            total = 0
+
+            for images, labels in train_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                optimizer.zero_grad()
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item() * images.size(0)
+                correct += (
+                    outputs.argmax(dim=1) == labels
+                ).sum().item()
+                total += labels.size(0)
+
+            train_loss = running_loss / total
+            train_acc = correct / total
+
+            # --------------------------------------------------------
+            # Validación
+            # --------------------------------------------------------
+            model.eval()
+
+            valid_running_loss = 0.0
+            valid_correct = 0
+            valid_total = 0
+
+            with torch.no_grad():
+                for images, labels in valid_loader:
+                    images = images.to(self.device)
+                    labels = labels.to(self.device)
+
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
+                    valid_running_loss += (
+                        loss.item() * images.size(0)
+                    )
+
+                    valid_correct += (
+                        outputs.argmax(dim=1) == labels
+                    ).sum().item()
+
+                    valid_total += labels.size(0)
+
+            valid_loss = valid_running_loss / valid_total
+            valid_acc = valid_correct / valid_total
+
+            history["train_loss"].append(train_loss)
+            history["valid_loss"].append(valid_loss)
+            history["train_acc"].append(train_acc)
+            history["valid_acc"].append(valid_acc)
+
+            logger.info(
+                "epoch %d/%d - "
+                "train_loss=%.4f train_acc=%.4f "
+                "valid_loss=%.4f valid_acc=%.4f",
+                epoch + 1,
+                self.settings.max_epochs,
+                train_loss,
+                train_acc,
+                valid_loss,
+                valid_acc,
+            )
+
+            # Se conservan en memoria los pesos correspondientes
+            # al menor valid_loss.
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                best_epoch = epoch + 1
+                epochs_without_improvement = 0
+
+                best_model_state = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
+
+            else:
+                epochs_without_improvement += 1
+
+            scheduler.step()
+
+            if (
+                epochs_without_improvement
+                >= self.settings.patience
+            ):
+                logger.info(
+                    "Early stopping en epoch %d "
+                    "(sin mejora en %d epochs).",
+                    epoch + 1,
+                    self.settings.patience,
+                )
+                break
+
+        if best_model_state is None:
+            raise RuntimeError(
+                "El entrenamiento finalizó sin obtener "
+                "un modelo válido."
+            )
+
+        # El checkpoint se guarda una sola vez al finalizar:
+        # contiene los mejores pesos y el historial completo.
+        self.active_checkpoint.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        torch.save(
+            {
+                "model_state_dict": best_model_state,
+                "class_names": train_ds.classes,
+                "model_name": self.active_model_name,
+                "history": history,
+                "best_epoch": best_epoch,
+                "best_valid_loss": best_valid_loss,
+                "epochs_trained": len(history["train_loss"]),
+            },
+            self.active_checkpoint,
+        )
+
+        logger.info(
+            "Entrenamiento finalizado. "
+            "Mejor valid_loss=%.4f en epoch %d. "
+            "Épocas ejecutadas=%d.",
+            best_valid_loss,
+            best_epoch,
+            len(history["train_loss"]),
+        )
+
+        self._loaded.pop(
+            self.active_model_name,
+            None,
+        )
 
     def evaluate_classifier(self) -> dict[str, float]:
-        """
-        Evalua el modelo activo sobre el conjunto de prueba.
+        checkpoint = self.load_model()
+        class_names = checkpoint["class_names"]
+        n_classes = len(class_names)
 
-        Debe reportar: accuracy, precision, recall (sensibilidad),
-        specificity (especificidad) y F1-Score. La matriz de confusion y las
-        curvas de entrenamiento se documentan en la notebook.
+        if self.active_model_name == "resnet18_finetuned":
+            model = self._build_resnet18_finetuned(n_classes)
+        else:
+            model = self._build_cnn_custom(n_classes)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
 
-        Retorna un dict con las metricas, ej:
-          {"accuracy": 0.91, "precision": 0.90, "recall": 0.89,
-           "specificity": 0.99, "f1": 0.90}
-        """
-        raise NotImplementedError("Etapa 2: implementar evaluate_classifier")
+        test_tf = self._build_transforms(train=False)
+        test_ds = datasets.ImageFolder(self.dataset_path / "test", transform=test_tf)
 
-    def extract_custom_embedding(self, image: np.ndarray) -> list[float]:
-        """
-        Genera el embedding de una imagen usando el modelo propio activo
-        (penultima capa del ResNet18 fine-tuned o de la CNN custom).
+        if test_ds.classes != class_names:
+            raise ValueError(
+                "Las clases de test no coinciden con las del checkpoint entrenado "
+                "(probable inconsistencia de nombres de carpeta)."
+            )
 
-        Se usa cuando EMBEDDING_MODEL != baseline para que la busqueda por
-        similitud (Etapa 1) funcione con los modelos entrenados.
-        La imagen llega en BGR (OpenCV). Retorna una lista de floats de
-        dimension EMBEDDING_DIM.
-        """
-        raise NotImplementedError("Etapa 2: implementar extract_custom_embedding")
+        test_loader = DataLoader(test_ds, batch_size=self.settings.batch_size, shuffle=False, num_workers=0 if self.device.type == "cpu" else 2, pin_memory=self.device.type == "cuda")
+
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(self.device)
+                outputs = model(images)
+                preds = outputs.argmax(dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.numpy())
+
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+
+        accuracy = float((all_preds == all_labels).mean())
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels, all_preds, average="macro", zero_division=0
+        )
+
+        cm = confusion_matrix(all_labels, all_preds)
+        specificities = []
+        for i in range(n_classes):
+            tp = cm[i, i]
+            fp = cm[:, i].sum() - tp
+            fn = cm[i, :].sum() - tp
+            tn = cm.sum() - tp - fp - fn
+            specificities.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+        specificity = float(np.mean(specificities))
+
+        return {
+            "accuracy": accuracy,
+            "precision": float(precision),
+            "recall": float(recall),
+            "specificity": specificity,
+            "f1": float(f1),
+        }

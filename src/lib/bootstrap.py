@@ -55,6 +55,7 @@ def build_classifier(settings: Settings) -> ClassifierService:
         image_size=settings.image_size,
         dataset_path=settings.dataset_path,
         output_path=settings.output_path,
+        settings=settings,
     )
 
 
